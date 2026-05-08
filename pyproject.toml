@@ -5,6 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "citrix-mcp"
 version = "0.1.0"
+description = "An MCP server for Citrix documentation, DaaS API reference, and community content."
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
@@ -13,6 +14,7 @@ dependencies = [
     "html2text>=2024.2.26",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.0.0",
+    "playwright>=1.44.0",
 ]
 
 [project.scripts]

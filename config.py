@@ -9,6 +9,11 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({
     "community.citrix.com",
 })
 
+# Hosts that require a headless browser (Cloudflare challenge, JS-rendered, etc.)
+BROWSER_HOSTS: frozenset[str] = frozenset({
+    "community.citrix.com",
+})
+
 _xdg = os.environ.get("XDG_CACHE_HOME")
 CACHE_DIR: Path = (Path(_xdg) if _xdg else Path.home() / ".cache") / "citrix-mcp"
 

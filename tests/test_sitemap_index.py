@@ -92,6 +92,45 @@ def test_search_after_refresh(tmp_path):
     assert any("vda" in r.url.lower() for r in results)
 
 
+def test_refresh_follows_urlset_sitemaps(tmp_path):
+    """Root sitemap uses <urlset> with <url><loc>...sitemap.xml entries — must recurse."""
+    root_xml = FIXTURE_DIR / "sitemap_urlset_of_sitemaps.xml"
+    product_xml = FIXTURE_DIR / "sitemap_product_sample.xml"
+
+    def fake_get(url, **kwargs):
+        r = MagicMock()
+        r.raise_for_status = MagicMock()
+        if "en-us" not in url:
+            r.text = root_xml.read_text()
+        else:
+            r.text = product_xml.read_text()
+        return r
+
+    import citrix_mcp.sitemap_index as si_module
+    original_roots = list(si_module._SITEMAP_ROOTS)
+    si_module._SITEMAP_ROOTS = ["https://docs.citrix.com/sitemap.xml"]
+    try:
+        with patch("citrix_mcp.sitemap_index.httpx.get", side_effect=fake_get):
+            idx = _make_index(tmp_path)
+            total = idx.refresh()
+        # 2 sub-sitemaps × 2 content pages each = 4 real pages
+        assert total == 4
+        # No .xml URLs should appear in the index
+        results = idx.search("sitemap")
+        assert results == []
+        # Real content is searchable
+        vda_results = idx.search("vda")
+        assert len(vda_results) >= 1
+    finally:
+        si_module._SITEMAP_ROOTS = original_roots
+
+
+def test_slug_title_strips_extension(tmp_path):
+    from citrix_mcp.sitemap_index import _slug_title
+    assert _slug_title("https://docs.citrix.com/en-us/citrix-daas/disaster-recovery.html") == "Disaster Recovery"
+    assert _slug_title("https://docs.citrix.com/en-us/citrix-daas/sitemap.xml") == "Sitemap"
+
+
 def test_refresh_is_idempotent(tmp_path):
     """Calling refresh twice should not duplicate entries."""
     index_xml = FIXTURE_DIR / "sitemap_index_sample.xml"

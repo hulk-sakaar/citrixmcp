@@ -34,6 +34,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS pages USING fts5(
 def _slug_title(url: str) -> str:
     path = urlparse(url).path.rstrip("/")
     slug = path.split("/")[-1] if path else url
+    slug = slug.rsplit(".", 1)[0] if "." in slug else slug
     return slug.replace("-", " ").replace("_", " ").title()
 
 
@@ -82,46 +83,57 @@ class SitemapIndex:
         conn.commit()
         total = 0
         for root_url in _SITEMAP_ROOTS:
-            root = self._fetch_xml(root_url)
-            if root is None:
-                continue
             host = urlparse(root_url).hostname or ""
-            # Collect sub-sitemap URLs
-            sub_urls: list[str] = []
-            for sitemap_el in root.findall("sm:sitemap", _NS):
-                loc = sitemap_el.findtext("sm:loc", namespaces=_NS)
-                if loc:
-                    sub_urls.append(loc.strip())
-            # If the root is itself a urlset (no sub-sitemaps), treat it as one
-            if not sub_urls:
-                sub_urls = [root_url]
-            for sub_url in sub_urls:
-                if urlparse(sub_url).hostname not in ALLOWED_HOSTS:
-                    logger.warning("Skipping sub-sitemap outside allowlist: %s", sub_url)
+            pending: list[str] = [root_url]
+            visited: set[str] = set()
+
+            while pending:
+                sitemap_url = pending.pop(0)
+                if sitemap_url in visited:
                     continue
-                parsed_product = _product_from_url(sub_url)
-                if product and parsed_product != product:
+                visited.add(sitemap_url)
+
+                if urlparse(sitemap_url).hostname not in ALLOWED_HOSTS:
+                    logger.warning("Skipping sitemap outside allowlist: %s", sitemap_url)
                     continue
-                if sub_url == root_url:
-                    sub_root = root
-                else:
-                    sub_root = self._fetch_xml(sub_url)
-                if sub_root is None:
+
+                xml_root = self._fetch_xml(sitemap_url)
+                if xml_root is None:
                     continue
+
                 rows = []
-                for url_el in sub_root.findall("sm:url", _NS):
+
+                # <sitemapindex> format: proper <sitemap><loc> children
+                for sitemap_el in xml_root.findall("sm:sitemap", _NS):
+                    loc = sitemap_el.findtext("sm:loc", namespaces=_NS)
+                    if loc:
+                        loc = loc.strip()
+                        if loc not in visited:
+                            pending.append(loc)
+
+                # <urlset> format: <url><loc> children
+                for url_el in xml_root.findall("sm:url", _NS):
                     loc = url_el.findtext("sm:loc", namespaces=_NS)
                     if not loc:
                         continue
                     loc = loc.strip()
-                    lastmod = url_el.findtext("sm:lastmod", namespaces=_NS) or ""
-                    rows.append((
-                        loc,
-                        _slug_title(loc),
-                        _product_from_url(loc),
-                        urlparse(loc).hostname or host,
-                        lastmod,
-                    ))
+                    if urlparse(loc).path.endswith(".xml"):
+                        # Sub-sitemap disguised as a content URL — recurse
+                        if loc not in visited:
+                            pending.append(loc)
+                    else:
+                        parsed_product = _product_from_url(loc)
+                        if product and parsed_product != product:
+                            continue
+                        lastmod = url_el.findtext("sm:lastmod", namespaces=_NS) or ""
+                        rows.append((
+                            loc,
+                            _slug_title(loc),
+                            parsed_product,
+                            urlparse(loc).hostname or host,
+                            lastmod,
+                        ))
+
                 if rows:
                     conn.executemany(
                         "INSERT INTO pages(url, title, product, host, last_modified) VALUES (?,?,?,?,?)",
@@ -129,7 +141,8 @@ class SitemapIndex:
                     )
                     conn.commit()
                     total += len(rows)
-                    logger.info("Indexed %d pages from %s", len(rows), sub_url)
+                    logger.info("Indexed %d pages from %s", len(rows), sitemap_url)
+
         conn.close()
         return total
 

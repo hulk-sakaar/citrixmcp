@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -9,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import ALLOWED_HOSTS, CACHE_DIR, MAX_CONCURRENCY, TTL_HOURS, USER_AGENT
+from .config import ALLOWED_HOSTS, BROWSER_HOSTS, CACHE_DIR, MAX_CONCURRENCY, TTL_HOURS, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,66 @@ def _hostname(url: str) -> str:
 
 def _cache_key(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()
+
+
+def _needs_browser(url: str) -> bool:
+    """Return True if this host requires a headless browser to fetch."""
+    return _hostname(url) in BROWSER_HOSTS
+
+
+async def _fetch_with_browser(url: str) -> dict:
+    """Use Playwright async API to render a page behind Cloudflare or JS rendering."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Give Cloudflare challenge and JS rendering time to complete
+            await page.wait_for_timeout(5000)
+            # If still on a challenge page, wait a bit longer
+            title = await page.title()
+            if "challenge" in page.url or "Just a moment" in (title or ""):
+                logger.info("Cloudflare challenge detected, waiting longer...")
+                await page.wait_for_timeout(10000)
+            final_url = page.url
+            html = await page.content()
+        finally:
+            await context.close()
+            await browser.close()
+
+    return {
+        "url": final_url,
+        "html": html,
+        "etag": None,
+        "last_modified": None,
+        "cached_at": datetime.now().isoformat(),
+    }
+
+
+def _run_browser_fetch(url: str) -> dict:
+    """Run the async browser fetch, handling both sync and async calling contexts."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # We're inside an async event loop — run in a separate thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _fetch_with_browser(url))
+            return future.result(timeout=90)
+    else:
+        return asyncio.run(_fetch_with_browser(url))
 
 
 class CitrixFetcher:
@@ -53,6 +114,7 @@ class CitrixFetcher:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = self._cache_dir / f"{_cache_key(url)}.json"
 
+        # Check cache first
         cached: dict | None = None
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
@@ -61,6 +123,17 @@ class CitrixFetcher:
                 logger.debug("Cache hit (fresh): %s", url)
                 return cached
 
+        # Use Playwright for hosts that need a browser
+        if _needs_browser(url):
+            logger.info("Using browser fetch for: %s", url)
+            with _semaphore:
+                result = _run_browser_fetch(url)
+            # Validate final URL after any redirects
+            self._validate_host(result["url"])
+            cache_file.write_text(json.dumps(result))
+            return result
+
+        # Standard httpx fetch
         headers: dict[str, str] = {}
         if cached:
             if cached.get("etag"):
